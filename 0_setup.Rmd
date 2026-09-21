@@ -1,0 +1,66 @@
+---
+title: "Pre-course preparation"
+author: "Denis Rustand (denis.rustand@u-bordeaux.fr)"
+date: "September 27, 2026"
+output: pdf_document
+subtitle: "Efficient Bayesian Analysis of Longitudinal and Survival Data Using R-INLA
+  \\\nISCB 2026, Freiburg, Germany\n"
+---
+
+# Before the course
+
+Running the code during the course is **optional**. If you want to run the code, please complete the following steps **before the course**. Installing packages can take time, so do not leave this for the last minute.
+
+GITHUB : <https://github.com/DenisRustand/ISCB2026>
+
+## R version
+
+You need **R \>= 4.6**. Check with:
+
+```{r check-r, eval=FALSE}
+R.version.string
+```
+
+If your version is older, update from <https://cloud.r-project.org>.
+
+## Package installation
+
+```{r install, eval=FALSE}
+install.packages("INLA",
+  repos = c(getOption("repos"),
+            INLA = "https://inla.r-inla-download.org/R/testing"))
+
+install.packages(c("INLAjoint", "ggplot2", "ggpubr", "survival",
+                   "mvtnorm", "PermAlgo", "JM",
+                   "rmarkdown", "knitr", "sn"))
+```
+
+## Verify installation
+
+Run the following to check that the core packages load and compute correctly:
+
+```{r verify, eval=FALSE}
+library(INLA)
+library(INLAjoint)
+cat("INLA version:", inla.version()$version, "\n")
+cat("INLAjoint version:", as.character(packageVersion("INLAjoint")), "\n")
+
+# Toy example: intercept of y ~ 1 with two observations (2 and 8) should be 5
+m <- inla(y ~ 1, data = list(y = c(2, 8)),
+          control.compute = list(config = TRUE))
+cat("Intercept (expected 5):", round(m$summary.fixed["(Intercept)", "mean"], 1), "\n")
+invisible(inla.posterior.sample(1, m))
+cat("Posterior sampling: OK\n")
+```
+
+On Linux, if INLA throws a binary error, try switching binaries:
+
+```{r linux-fix, eval=FALSE}
+inla.binary.install()
+```
+
+## Common issues
+
+- **Linux users**: you may need system libraries `libudunits2-dev`, `libgdal-dev`, `libgeos-dev`, `libproj-dev`, `libsqlite3-dev` and `libgsl-dev`.
+- **Mac users**: make sure Xcode command line tools are installed (`xcode-select --install`)
+- **Windows users**: Rtools may be required for some packages
