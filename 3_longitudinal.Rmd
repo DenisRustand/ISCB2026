@@ -1,0 +1,747 @@
+---
+title: "Longitudinal Data Analysis"
+author: "Denis Rustand"
+date: "September 27, 2026"
+subtitle: |
+  Efficient Bayesian Analysis of Longitudinal and Survival Data Using R-INLA \
+  ISCB 2026, Freiburg, Germany
+output:
+  pdf_document:
+    toc: false
+  html_document:
+    toc: false
+    toc_float: false
+    theme: flatly
+    mathjax: default
+---
+
+```{=html}
+<style>
+pre, pre code {
+  white-space: pre !important;
+  overflow-x: auto !important;
+  word-break: keep-all !important;
+  word-wrap: initial !important;
+}
+</style>
+```
+
+```{r setup, include=FALSE}
+options(width = 200)
+knitr::opts_chunk$set(cache = TRUE, message = FALSE, warning = FALSE,
+                      fig.align = "center")
+```
+
+```{r, cache=FALSE}
+library(INLA)
+library(INLAjoint)
+library(ggplot2)
+library(ggpubr)
+```
+
+# Longitudinal data
+
+```{r}
+set.seed(1)
+n <- 30
+Sigma <- matrix(c(0.8, 0.2, 0.2, 0.4), 2) # true RE var-cov: int .8, slope .4, cov .2
+b <- MASS::mvrnorm(n, c(0, 0), Sigma)
+simDat <- do.call(rbind, lapply(seq_len(n), function(i) {
+  t <- sort(runif(4, 0, 2)) # few visits, short follow-up
+  data.frame(id = i, time = t,
+             Y = 3 + b[i, 1] + (-0.5 + b[i, 2]) * t + rnorm(4, 0, 0.6))
+}))
+
+head(simDat)
+```
+
+Each row is one visit, not one patient.
+
+## A few patients
+
+```{r}
+ids_show <- unique(simDat$id)[1:12]
+
+ggplot(simDat[simDat$id %in% ids_show, ], aes(x = time, y = Y)) +
+  facet_wrap(~id) +
+  geom_point(size = 1) +
+  geom_line(alpha = 0.6) +
+  labs(x = "Time (years)", y = "Marker") +
+  theme_minimal()
+```
+
+# Linear regression
+
+As a first pass, we can fit an ordinary linear model.
+
+```{r}
+M_lm <- lm(Y ~ time, data = simDat)
+summary(M_lm)
+```
+
+Same with INLAjoint:
+
+```{r}
+M_lm2 <- joint(formLong = Y ~ time, 
+               dataLong = simDat, id = "id", timeVar = "time")
+summary(M_lm2) # sdcor=T for std dev instead of variance
+```
+
+# Linear mixed-effects models
+
+## Random intercept model
+
+First, allow each patient to have their own baseline level:
+
+$$\eta_i(t) = (\beta_0 + b_{i0}) + \beta_1t.$$
+
+```{r}
+M_ri <- joint(
+  formLong = Y ~ time + (1 | id),
+  dataLong = simDat,
+  id = "id",
+  timeVar = "time"
+)
+summary(M_ri, sdcor = TRUE)
+```
+
+The random intercept standard deviation tells us how much patients differ at baseline after accounting for time.
+
+```{r}
+head(M_ri$summary.random$IDIntercept_L1)
+```
+
+## Individual fits from the random intercept model
+
+`summary.fitted.values` gives the fitted values at the observed visits, including the random effects. Here the rows follow the order of the data used to fit the model.
+
+```{r}
+fit_ri <- cbind(simDat, M_ri$summary.fitted.values)
+
+ggplot(fit_ri[fit_ri$id %in% ids_show, ], aes(x = time, y = mean)) +
+  facet_wrap(~id) +
+  geom_line(color = "steelblue") +
+  geom_point(data = simDat[simDat$id %in% ids_show, ],
+             aes(x = time, y = Y), size = 0.8) +
+  labs(x = "Time (years)", y = "Marker",
+       title = "Random intercept model") +
+  theme_minimal()
+```
+
+The fitted lines are shifted up or down by patient, but their slopes remain parallel.
+
+[Is it realistic that every patient changes at the same rate?]{style="color:steelblue;"}
+
+## Random intercept and slope model
+
+Now each patient can also have their own rate of change:
+
+$$\eta_i(t) = (\beta_0 + b_{i0}) + (\beta_1 + b_{i1})t.$$
+
+```{r}
+M_rs <- joint(
+  formLong = Y ~ time + (1 + time | id),
+  dataLong = simDat,
+  id = "id",
+  timeVar = "time"
+)
+summary(M_rs, sdcor = TRUE)
+```
+
+Now the model estimates a random intercept, a random slope and their correlation. The `sdcor = TRUE` argument is useful: standard deviations and correlations are much easier to interpret than variances and covariances.
+
+The same information can be inspected graphically. `plot()` returns a list of `ggplot2` objects, so we can print the component we want and still modify it with ordinary `ggplot2` syntax if needed.
+
+```{r}
+plot(M_rs)$Outcomes$L1
+```
+
+```{r}
+plot(M_rs, sdcor = TRUE)$Covariances$L1
+```
+
+## Individual fits from the random slope model
+
+```{r}
+fit_rs <- cbind(simDat, M_rs$summary.fitted.values)
+
+ggplot(fit_rs[fit_rs$id %in% ids_show, ], aes(x = time, y = mean)) +
+  facet_wrap(~id) +
+  geom_line(color = "steelblue") +
+  geom_ribbon(aes(ymin = `0.025quant`, ymax = `0.975quant`),
+              alpha = 0.2, fill = "steelblue") +
+  geom_point(data = simDat[simDat$id %in% ids_show, ],
+             aes(x = time, y = Y), size = 0.8) +
+  labs(x = "Time (years)", y = "Marker",
+       title = "Random intercept and slope model") +
+  theme_minimal()
+```
+
+## Priors for the model parameters
+
+Two prior families.
+
+- Fixed effects: Gaussian, mean 0, precision 0.01. Weakly informative. Argument `priorFixed`.
+- Random-effects var-cov: Inverse Wishart. Argument `priorRandom`.
+
+Check what this model used:
+
+```{r}
+M_rs$priors_used$priorFixed
+M_rs$priors_used$priorRandom
+```
+
+Informative data: the prior barely moves the posterior. Weak data: a strong prior can take over.
+
+[If the prior and the posterior land on top of each other for a parameter, what is the data telling us?]{style="color:steelblue;"}
+
+Compare the default prior to a strong one. Red lines are the truth.
+
+```{r}
+M_inf <- joint(formLong = Y ~ time + (1 + time | id), dataLong = simDat,
+               id = "id", timeVar = "time",
+               control = list(int.strategy = "eb", priorRandom = list(r = 100)))
+
+truth <- data.frame(
+  Effect = unique(plot(M_rs, sdcor = TRUE)$Covariances$L1$data$Effect),
+  TrueValues = c(cov2cor(Sigma) + diag(sqrt(diag(Sigma)) - 1)))
+```
+
+Default prior:
+
+```{r}
+plot(M_rs, sdcor = TRUE, priors = TRUE)$Covariances$L1 +
+  geom_vline(aes(xintercept = TrueValues), data = truth, colour = 2, linetype = 2)
+```
+
+Informative prior (r = 100), posterior pulled toward zero:
+
+```{r}
+plot(M_inf, sdcor = TRUE, priors = TRUE)$Covariances$L1 +
+  geom_vline(aes(xintercept = TrueValues), data = truth, colour = 2, linetype = 2)
+```
+
+Strong priors on random effects are sensitive, so check sensitivity before trusting them.
+
+Prior sensitivity analysis can help detect identifiability issues, as well as how much the posterior is influenced by the prior.
+
+# Nonlinear trajectories
+
+Any function of time can be considered to capture non-linear trajectories.
+
+```{r, fig.height=4}
+set.seed(3)
+n  <- 150
+dat <- expand.grid(id = 1:n, time = 0:8)
+dat <- dat[order(dat$id, dat$time), ]
+
+# shared timing: flat, a rise between t = 2 and t = 6, then flat again
+ramp <- pmin(pmax((dat$time - 2) / 4, 0), 1)
+
+lev   <- rnorm(n, 3, 0.8)     # patient baseline
+amp   <- rnorm(n, 5, 1.0)     # patient rise height (subject-specific shape)
+drift <- rnorm(n, 0, 0.15)    # patient late deviation
+
+dat$Y <- rnorm(nrow(dat),
+  lev[dat$id] + amp[dat$id] * ramp + drift[dat$id] * (dat$time - 4), 0.4)
+
+ggplot(dat, aes(time, Y, group = id)) +
+  geom_line(alpha = 0.10, color = "steelblue") +
+  labs(x = "Time", y = "Marker") +
+  theme_minimal()
+```
+
+We select 4 patients to check the fit:
+
+```{r}
+sel <- order(amp)[c(1, 50, 100, 150)]
+```
+
+Let's plot some patient observed points against the model's fitted trajectory (one panel per patient).
+
+```{r}
+show_fit <- function(model, data, ids) {
+  fit <- cbind(data, model$summary.fitted.values)
+  ggplot(fit[fit$id %in% ids, ], aes(time, mean)) +
+    geom_ribbon(aes(ymin = `0.025quant`, ymax = `0.975quant`),
+                fill = "steelblue", alpha = 0.18) +
+    geom_line(color = "steelblue") +
+    geom_point(aes(y = Y), size = 1) +
+    facet_wrap(~id) +
+    labs(x = "Time", y = "Marker") +
+    theme_minimal()
+}
+```
+
+```{r}
+f1 <- function(time) time^2
+```
+
+Let's try adding a quadratic term:
+
+```{r, fig.height=4}
+fit_quad <- joint(
+  formLong = Y ~ time + f1(time) + (1 + time + f1(time) | id),
+  dataLong = dat, id = "id", timeVar = "time",
+  family = "gaussian"
+)
+show_fit(fit_quad, dat, sel)
+```
+
+## What about spline functions?
+
+Instead of one curve over the whole window, we let the trend be flexible only where it changes. Natural cubic splines with knots placed at the two change points, `t = 2` and `t = 6`, can do this. They enter the formula through the same functions of time structure, in the fixed and the random part, so each patient again gets their own curve.
+
+```{r}
+library(splines)
+
+# knots at the two change points -> 3 basis columns
+NS <- ns(dat$time, knots = c(2, 6))
+f1 <- function(time) predict(NS, time)[, 1]
+f2 <- function(time) predict(NS, time)[, 2]
+f3 <- function(time) predict(NS, time)[, 3]
+```
+
+```{r}
+fit_spl <- joint(
+  formLong = Y ~ f1(time) + f2(time) + f3(time) +
+                 (1 + f1(time) + f2(time) + f3(time) | id),
+  dataLong = dat, id = "id", timeVar = "time",
+  family = "gaussian"
+)
+summary(fit_spl, sdcor = TRUE)
+```
+
+```{r, fig.height=4}
+show_fit(fit_spl, dat, sel)   # flat, rise, flat: all three phases recovered
+```
+
+Model comparison based on WAIC:
+
+```{r}
+joint.compare(fit_quad, fit_spl)
+```
+
+# Generalized longitudinal mixed models
+
+Same fixed and random effects, different **family** and **link function**.
+
+$$Y_{ij} \mid b_i \sim \text{distribution suited to the marker},
+\qquad g\{E(Y_{ij} \mid b_i)\}=\eta_i(t_{ij}).$$
+
+## Poisson mixed model for counts
+
+For patient $i$ at visit $j$,
+
+$$Y_{ij} \mid b_i \sim \text{Poisson}(\lambda_{ij}),
+\qquad \log(\lambda_{ij}) = \eta_i(t_{ij}).$$
+
+The coefficients are interpreted on the count scale through the exponential. A value of $-0.20$ means the expected count is multiplied by $\exp(-0.20)$, i.e., an ~18% drop.
+
+Let's simulate some count data:
+```{r}
+set.seed(1)
+n_p <- 500
+visit_times <- 0:5
+
+datPois <- expand.grid(id = 1:n_p, time = visit_times)
+datPois <- datPois[order(datPois$id, datPois$time), ]
+datPois$trt <- rep(rbinom(n_p, 1, 0.5), each = length(visit_times))
+datPois$Treatment <- factor(datPois$trt, levels = c(0, 1),
+                            labels = c("trt = 0", "trt = 1"))
+
+b_pois <- rep(rnorm(n_p, 0, 0.5), each = length(visit_times))
+eta_pois <- 1 + b_pois - 0.25 * datPois$time - 0.35 * datPois$trt + 0.5 * datPois$time * datPois$trt
+datPois$Y <- rpois(nrow(datPois), exp(eta_pois))
+```
+
+```{r}
+pois_mean <- aggregate(Y ~ time + Treatment, datPois, mean)
+
+ggplot(datPois, aes(x = time, y = Y, group = id, color = Treatment)) +
+  geom_line(alpha = 0.08) +
+  geom_point(alpha = 0.10, size = 0.6) +
+  geom_line(data = pois_mean, aes(group = Treatment), linewidth = 1.2) +
+  labs(x = "Time", y = "Count") +
+  scale_color_manual(values = c("gray40", "steelblue")) +
+  theme_minimal()
+```
+
+The model fit is similar, we just need to define the appropriate family:
+
+```{r, cache=TRUE}
+M_pois <- joint(
+  formLong = Y ~ time * trt + (1 | id),
+  dataLong = datPois,
+  id = "id",
+  timeVar = "time",
+  family = "poisson"
+)
+summary(M_pois, sdcor = TRUE)
+```
+
+- `trt`: treatment log-count ratio at time 0. Exponentiate for the count ratio.
+- `time:trt`: difference in time slopes between arms.
+- Random-intercept SD: between-patient variation on the log-count scale.
+
+For a Gaussian marker the link is the identity. For counts and yes/no markers, `summary.fitted.values` already applies the inverse link, so the fitted values and intervals are on the count or probability scale.
+
+```{r, cache=TRUE}
+pois_ids <- unique(datPois$id)[1:6]
+fit_pois <- cbind(datPois, M_pois$summary.fitted.values)
+
+ggplot(fit_pois[fit_pois$id %in% pois_ids, ], aes(x = time, y = mean)) +
+  geom_ribbon(aes(ymin = `0.025quant`, ymax = `0.975quant`),
+              fill = "steelblue", alpha = 0.18) +
+  geom_line(color = "steelblue") +
+  geom_point(aes(y = Y), size = 1) +
+  facet_wrap(~id) +
+  labs(x = "Time", y = "Expected count") +
+  theme_minimal()
+```
+
+The curve is the posterior mean of $\lambda_{ij}$, with a 95% credible interval for the underlying mean count.
+
+## Binomial mixed model for binary outcomes
+
+Binary outcomes (`0/1`), `family = "binomial"` and a logit link.
+
+$$Y_{ij} \mid b_i \sim \text{Bernoulli}(p_{ij}),
+\qquad \text{logit}(p_{ij}) = \eta_i(t_{ij}).$$
+
+```{r}
+datBinom <- datPois[, c("id", "time", "trt", "Treatment")]
+eta_binom <- -1 + b_pois + 0.15 * datBinom$time +  0.70 * datBinom$trt - 0.50 * datBinom$time * datBinom$trt
+datBinom$Y <- rbinom(nrow(datBinom), size = 1, prob = plogis(eta_binom))
+```
+
+```{r}
+tox_prop <- aggregate(Y ~ time + Treatment, datBinom, mean)
+
+ggplot(tox_prop, aes(x = time, y = Y, color = Treatment)) +
+  geom_point(size = 2) +
+  geom_line(linewidth = 1) +
+  labs(x = "Time", y = "Observed proportion") +
+  scale_color_manual(values = c("gray40", "steelblue")) +
+  theme_minimal()
+```
+
+```{r, cache=TRUE}
+M_binom <- joint(
+  formLong = Y ~ time * trt + (1 | id),
+  dataLong = datBinom,
+  id = "id",
+  timeVar = "time",
+  family = "binomial"
+)
+summary(M_binom, sdcor = TRUE)
+```
+
+- `trt`: treatment log-odds ratio at time 0. The simulated odds ratio is $\exp(0.70) \approx 2.01$.
+- `time:trt`: change in the treatment log-odds ratio per unit time.
+
+```{r, cache=TRUE}
+binom_ids <- unique(datBinom$id)[1:4]
+fit_binom <- cbind(datBinom, M_binom$summary.fitted.values)
+
+ggplot(fit_binom[fit_binom$id %in% binom_ids, ], aes(x = time, y = mean)) +
+  geom_ribbon(aes(ymin = `0.025quant`, ymax = `0.975quant`),
+              fill = "steelblue", alpha = 0.18) +
+  geom_line(color = "steelblue") +
+  geom_point(aes(y = Y), size = 1) +
+  facet_wrap(~id) +
+  labs(x = "Time", y = "Fitted probability") +
+  theme_minimal()
+```
+
+The points are 0 and 1. The line and 95% credible band describe each patient's fitted probability of `Y = 1`.
+
+## Ordinal mixed model
+
+Many outcomes are categorized as ordered grades.
+
+- a grade is ordered, Low below Moderate below High
+- code them 1, 2, 3 and a straight line assumes the step Low to Moderate equals Moderate to High
+- it can predict 2.7, a grade that does not exist
+
+What the proportional-odds model changes:
+
+- it works on cumulative probabilities, $P(Y \le k)$
+- a set of ordered cut-points marks the thresholds between grades
+- one slope per covariate shifts every threshold together, the proportional-odds idea
+- order is respected, equal spacing is not assumed
+
+$$\text{logit}\{P(Y_{ij} \le k \mid b_i)\} = \alpha_k - \eta_i(t_{ij}).$$
+
+The cut-points $\alpha_k$ set the boundaries. The linear predictor slides probability mass toward lower or higher grades.
+
+Written out for $K$ ordered grades $y_k\ (k = 1, \dots, K)$, the proportional odds model is
+
+$$F(k) = P(Y \le k) = \frac{\exp(\gamma_k)}{1 + \exp(\gamma_k)}, \qquad \gamma_k = \alpha_k - \eta_i(t),$$
+
+where the $\alpha_k$ form an increasing sequence of $K - 1$ cut-points,
+
+$$\alpha_0 = -\infty < \alpha_1 < \alpha_2 < \dots < \alpha_{K-1} < \alpha_K = +\infty,$$
+
+and the linear predictor carries the covariates and the random effects, for example considering a random intercept:
+
+$$\eta_i(t) = b_{i0} + \beta_1\, t + \beta_2\, trt_i + \beta_3\, trt_i\, t.$$
+
+We simulate from this model with four cut-points, giving five ordered grades that we read as grades 1 (mildest) to 5 (most severe). Here treatment and time both raise the linear predictor, so both push probability mass toward the worse grades.
+
+```{r}
+set.seed(4)
+
+# draw an ordinal outcome from a proportional odds model
+rpom <- function(alpha, eta) { # alpha: cut-points, eta: linear predictor
+  Flog  <- function(x) 1 / (1 + exp(-x)) # logistic CDF -> logit link
+  ns <- length(eta)
+  nc <- length(alpha) + 1
+  y  <- numeric(ns)
+  for (k in 1:ns) {
+    p    <- diff(c(0, Flog(alpha - eta[k]), 1))
+    y[k] <- sample(1:nc, 1, prob = p)
+  }
+  y
+}
+
+datOrd <- datPois[, c("id", "time", "trt", "Treatment")]
+linPred <- b_pois + 0.1 * datOrd$time + 1 * datOrd$trt
+alpha   <- quantile(linPred, c(0.2, 0.4, 0.6, 0.8))
+
+datOrd$Grade <- rpom(alpha, linPred)
+datOrd$trt <- factor(datOrd$trt)
+```
+
+The outcome is an ordered grade, spread across the five levels:
+
+```{r}
+table(datOrd$Grade)
+```
+
+Individual trajectories over follow-up (a random sample of patients):
+
+```{r}
+set.seed(1)
+show <- sample(unique(datOrd$id), 30)
+ggplot(subset(datOrd, id %in% show),
+       aes(time, Grade, group = id, colour = Treatment)) +
+  geom_line(alpha = 0.5) + geom_point(size = 1) +
+  scale_y_continuous(breaks = 1:5) +
+  labs(x = "Time", y = "Grade", colour = "Arm") +
+  theme_minimal()
+```
+
+We fit the model with `family = "pom"` and a logit link. Since `logit` is already the default for the `pom` family, writing `link = "logit"` here just makes the choice explicit.
+
+```{r, cache=TRUE}
+M_pom <- joint(formLong = Grade ~ -1 + time * trt + (1 | id),
+               dataLong = datOrd, id = "id", timeVar = "time",
+               family = "pom", link = "logit")
+summary(M_pom, sdcor = TRUE)
+```
+
+Here `pom` is INLA's proportional-odds family. The cut-points take the place of a single intercept, which is why the formula drops the global intercept.
+
+INLA stores the cut-points through an internal parameterization, so we convert the sampled `theta` values back to the $\alpha_k$ and compare them with the values used to simulate:
+
+```{r}
+theta <- inla.hyperpar.sample(1e5, M_pom, intern = TRUE)
+nms   <- paste(paste0("theta", 1:length(alpha)), "for POM")
+
+sim.alpha <- matrix(NA, nrow(theta), length(alpha))
+for (k in 1:length(alpha)) {
+  if (k == 1) {
+    sim.alpha[, k] <- theta[, nms[1]]
+  } else {
+    sim.alpha[, k] <- sim.alpha[, k - 1] + exp(theta[, nms[k]])
+  }
+}
+colnames(sim.alpha) <- paste0("alpha", 1:length(alpha))
+
+m1 <- colMeans(sim.alpha)
+m2 <- colMeans(sim.alpha^2)
+print(cbind(true = alpha, estimate = m1, stdev = sqrt(m2 - m1^2)))
+```
+
+The recovered cut-points are close to the truth: these are the boundaries that separate the five grades on the latent scale, while the fixed effects measure how covariates move a patient toward a higher (worse) grade.
+
+For treatment, the odds ratio at baseline is $\exp(\beta_2)$, so `trt = 1` carries about
+
+```{r}
+round(exp(M_pom$summary.fixed[2, 1]), 2)
+```
+
+times the odds of being in a worse grade than the reference arm. Because of the proportional-odds structure, "a worse grade" means the same shift applied at every threshold at once: the odds of grade $\ge 2$ versus grade 1, of grade $\ge 3$ versus grades $\le 2$, and so on up to grade 5 versus grades 1 to 4. A single odds ratio therefore summarizes the treatment's tendency to push patients toward higher grade across all grade boundaries.
+
+# Multiple longitudinal markers
+
+Consider tumor size (continuous), lesion count (Poisson) and toxicity (binary), measured in the same patients.
+
+Each marker has its own regression model and link. `corLong = TRUE` allows the marker-specific random effects to correlate:
+
+$$\begin{aligned}
+\textrm{E}[\text{Size}_i(t)] &= \beta_{10} + b_{1i} + \beta_{11} t + \beta_{12}\, trt_i + \beta_{13}\, trt_i\, t \\
+\log \textrm{E}[\text{Count}_i(t)] &= \beta_{20} + b_{2i} + \beta_{21} t + \beta_{22}\, trt_i + \beta_{23}\, trt_i\, t \\
+\textrm{logit}\, \textrm{P}[\text{Tox}_i(t) = 1] &= \beta_{30} + b_{3i} + \beta_{31} t + \beta_{32}\, trt_i + \beta_{33}\, trt_i\, t
+\end{aligned}$$
+
+The random intercepts follow $(b_{1i}, b_{2i}, b_{3i}) \sim \mathcal{N}(0, \Sigma)$. The off-diagonal terms link the markers. Tumor size also includes Gaussian residual error.
+
+```{r}
+set.seed(1)
+
+n  <- 200 # patients
+ni <- 6 # visits per patient (times 0..5)
+
+# true cross-marker random-intercept covariance (size, count, toxicity)
+Sigma <- matrix(c(0.50, 0.25, 0.15,
+                  0.25, 0.40, 0.20,
+                  0.15, 0.20, 0.35), nrow = 3)
+
+b <- mvtnorm::rmvnorm(n, mean = c(0, 0, 0), sigma = Sigma)
+
+dat      <- expand.grid(time = 0:5, id = 1:n)
+dat$trt  <- rep(rbinom(n, 1, 0.5), each = ni)
+dat$Treatment <- factor(dat$trt, levels = c(0, 1),
+                        labels = c("trt = 0", "trt = 1"))
+
+b1 <- rep(b[, 1], each = ni) # tumor-size intercepts
+b2 <- rep(b[, 2], each = ni) # lesion-count intercepts
+b3 <- rep(b[, 3], each = ni) # severe-toxicity intercepts
+
+# tumor size
+dat$Size <- rnorm(nrow(dat), 5 + b1 - 0.30 * dat$time - 0.50 * dat$trt + 0.5 * dat$time * dat$trt, 0.5)
+
+# lesion count
+dat$Count <- rpois(nrow(dat), exp(1.2 + b2 + 0.10 * dat$time + 0.80 * dat$trt + 0.03 * dat$time * dat$trt))
+
+# severe toxicity
+eta3 <- -1.0 + b3 + 0.15 * dat$time + 0.50 * dat$trt + 0.2 * dat$time * dat$trt
+dat$Tox <- rbinom(nrow(dat), size = 1, prob = 1 / (1 + exp(-eta3)))
+```
+
+The three markers evolve together, one row per visit:
+
+```{r}
+head(dat, 10)
+```
+
+Plotting them side by side:
+
+```{r}
+datPlot <- rbind(
+  data.frame(id = dat$id, time = dat$time, Treatment = dat$Treatment,
+             Marker = "Tumor size",       Value = dat$Size),
+  data.frame(id = dat$id, time = dat$time, Treatment = dat$Treatment,
+             Marker = "Lesion count",   Value = dat$Count),
+  data.frame(id = dat$id, time = dat$time, Treatment = dat$Treatment,
+             Marker = "Toxicity", Value = dat$Tox)
+)
+datPlot$Marker <- factor(datPlot$Marker, levels = c("Tumor size", "Lesion count", "Toxicity"))
+
+ggplot(datPlot, aes(time, Value, group = id, colour = Treatment)) +
+  geom_line(alpha = 0.5) +
+  facet_wrap(~ Marker, scales = "free_y") +
+  scale_colour_manual(values = c("gray40", "steelblue")) +
+  labs(x = "Time", y = "Observed marker", colour = "Arm") +
+  theme_minimal()
+```
+
+A list of formulas, one family per marker and `corLong = TRUE`:
+
+```{r, cache=TRUE}
+M_multi <- joint(
+  formLong = list(
+    Size   ~ time * trt + (1 | id),
+    Count  ~ time * trt + (1 | id),
+    Tox ~ time * trt + (1 | id)
+  ),
+  dataLong = dat, id = "id", timeVar = "time",
+  family  = c("gaussian", "poisson", "binomial"),
+  corLong = TRUE
+)
+summary(M_multi, sdcor = TRUE)
+```
+
+The correlations describe how patient-specific deviations relate across markers, after accounting for time and treatment.
+
+## Recovering the correlation structure
+
+Posterior standard deviations and correlations. Red dashed lines: simulated values.
+
+```{r}
+p <- plot(M_multi, sdcor = TRUE)$Covariances$L1
+
+# true values on the sd/correlation scale: sds on the diagonal, correlations off it
+trueSDcor <- cov2cor(Sigma) + diag(sqrt(diag(Sigma)) - 1)
+
+p + geom_vline(
+  data = data.frame(Effect = unique(p$data$Effect), TrueValues = c(trueSDcor)),
+  aes(xintercept = TrueValues), colour = 2, linetype = 2)
+```
+
+Same with priors:
+
+```{r}
+p <- plot(M_multi, sdcor = TRUE, priors = TRUE)$Covariances$L1
+p + geom_vline(
+  data = data.frame(Effect = unique(p$data$Effect), TrueValues = c(trueSDcor)),
+  aes(xintercept = TrueValues), colour = 2, linetype = 2)
+```
+
+The toxicity random-effect variance is less precisely estimated in this example.
+
+## Predictions for a new patient
+
+For a new patient, `predict()` uses the available measurements. Markers can have different observation times, with `NA` for unobserved values.
+
+```{r}
+new_multi <- data.frame(
+  id = 201, time = c(0, 1, 1.5, 2), trt = 0,
+  Size = c(5.5, 5.2, NA, 4.9),
+  Count = c(5, NA, 4, 6),
+  Tox = c(0, NA, NA, 1)
+)
+
+set.seed(1)
+pred_all <- predict(M_multi, newData = new_multi, horizon = 5,
+                    id = "id", inv.link = TRUE)
+```
+
+`inv.link = TRUE` returns the trajectories on the marker scale: tumor size, expected lesion count and toxicity probability.
+
+```{r, fig.height=4, fig.width=9}
+new_multi_plot <- data.frame(
+  time = rep(new_multi$time, 3),
+  Outcome = rep(c("Size", "Count", "Tox"), each = nrow(new_multi)),
+  value = unlist(new_multi[, c("Size", "Count", "Tox")])
+)
+
+ggplot(pred_all$PredL, aes(time, quant0.5)) +
+  geom_ribbon(aes(ymin = quant0.025, ymax = quant0.975),
+              fill = "steelblue", alpha = 0.18) +
+  geom_line(color = "steelblue") +
+  geom_point(data = new_multi_plot, aes(y = value), size = 1.5, na.rm = TRUE) +
+  geom_vline(xintercept = 2, linetype = 2) +
+  facet_wrap(~Outcome, scales = "free_y") +
+  labs(x = "Time", y = "Marker trajectory") +
+  theme_minimal()
+```
+
+The points are the new patient's measurements. The dashed line marks the last observed visit. The bands describe uncertainty in the underlying trajectories. For Gaussian longitudinal outcomes, `resErrLong = TRUE` adds residual error to the prediction distribution for a future measurement.
+
+> This correlation is the same machinery that powers the joint model.
+>
+> - one patient, several markers, tied through shared or correlated random effects
+> - each marker can become a longitudinal submodel
+> - those same random effects can inform the risk of death through the association term
+
+# Longitudinal session summary
+
+- Random intercepts and slopes capture patient heterogeneity around population-average trajectories.
+- Flexible time effects extend mixed models to nonlinear trajectories.
+- The same framework handles Gaussian, count, binary and ordinal longitudinal outcomes.
+- Multiple markers can be modeled together through correlated random effects and used for individual prediction.
+
+The next session combines longitudinal and survival processes in joint models.
